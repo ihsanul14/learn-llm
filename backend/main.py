@@ -13,49 +13,38 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 ollama_client = AsyncClient(host="http://localhost:11434")
 
+PYTHON_PATH = os.getenv("MCP_PYTHON_PATH", "python3")
+
 server_params = StdioServerParameters(
-    command="/home/user/Python/software-engineering/learn-llm/backend/venv/bin/python3",
+    command=PYTHON_PATH,
     args=["-m", "mcp_server.mcp_server"],
     env=None
 )
 
 async def event_generator(messages: list):
-    user_query = messages[-1]["content"]
-    
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            available_tools = await session.list_tools()
             
+            available_tools = await session.list_tools()
             ollama_tools = [
                 {
                     "type": "function",
                     "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema,
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.inputSchema,
                     },
-                }
-                for tool in available_tools.tools
+                } for t in available_tools.tools
             ]
 
-            yield json.dumps({"status": "Searching Knowledge Base..."}) + "\n"
-            rag_result = await session.call_tool("search_knowledge_base", {"query": user_query})
-            rag_context = rag_result.content[0].text if rag_result.content else "No local info."
-
             system_prompt = (
-                f"## LOCAL KNOWLEDGE CONTEXT:\n{rag_context}\n\n"
-                "## OPERATIONAL SEQUENCE:\n"
-                "1. RAG-FIRST: Always analyze the LOCAL KNOWLEDGE CONTEXT first. If the answer is there, provide it immediately. DO NOT use tools if the context is sufficient.\n"
-                "2. SEARCH: If the context is missing, irrelevant, or the user asks for 'live' info, use the 'web_search' tool. Do not ask for permission; just search.\n"
-                "3. FILE-ACTION: If the user asks to save, download, or create a document (like .docx or .txt), you MUST use 'create_file_for_download'. You have direct server access; DO NOT ask for cloud permissions or 'Proceed?'. Just call the tool.\n\n"
-                "## OUTPUT FORMAT:\n"
-                "- Provide the direct answer first.\n"
-                "- If you created a file, provide the link exactly as: http://localhost:30001/api/download/FILENAME\n"
-                "- DO NOT mention proxy servers, cloud storage, or external permissions."
+                "You are a helpful assistant. "
+                "Use tools ONLY if the user asks for technical information, files, or web searches. "
+                "For casual greetings (hi, hello, etc.), reply normally with a brief greeting. "
+                "Output ONLY the final result. NO internal reasoning."
             )
 
-            yield json.dumps({"status": "Analyzing Request..."}) + "\n"
             response = await ollama_client.chat(
                 model="llama3.1",
                 messages=[{"role": "system", "content": system_prompt}] + messages,
@@ -69,25 +58,20 @@ async def event_generator(messages: list):
                     name = tool_call["function"]["name"]
                     args = tool_call["function"]["arguments"]
                 
-                    if name == "search_knowledge_base":
-                        continue
-
-                    yield json.dumps({"status": f"Executing {name}..."}) + "\n"
+                    yield json.dumps({"status": f"Invoking {name}..."}) + "\n"
                     mcp_result = await session.call_tool(name, args)
-                    result_text = mcp_result.content[0].text
-                    
-                    messages.append({"role": "tool", "content": result_text, "name": name})
+                    messages.append({"role": "tool", "content": mcp_result.content[0].text, "name": name})
 
-            yield json.dumps({"status": "Finalizing..."}) + "\n"
-            final_stream = await ollama_client.chat(
-                model="llama3.1",
-                messages=[{"role": "system", "content": system_prompt}] + messages,
-                stream=True
-            )
-
-            async for chunk in final_stream:
-                if chunk.get("message", {}).get("content"):
-                    yield json.dumps(chunk.model_dump()) + "\n"
+                final_stream = await ollama_client.chat(
+                    model="llama3.1",
+                    messages=[{"role": "system", "content": system_prompt}] + messages,
+                    stream=True
+                )
+                async for chunk in final_stream:
+                    if chunk.get("message", {}).get("content"):
+                        yield json.dumps(chunk.model_dump()) + "\n"
+            else:
+                yield json.dumps(response.model_dump()) + "\n"
 
 @app.post("/api/chat")
 async def chat_endpoint(request: Request):

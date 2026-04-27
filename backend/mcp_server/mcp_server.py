@@ -1,97 +1,54 @@
 import os
-import asyncio
-import logging
-import sys
-import mcp.types as types
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.fastmcp import FastMCP
+from docx import Document
 from langchain_community.tools import DuckDuckGoSearchRun
-import uvicorn
+from rag.rag import RAGService
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("mcp-sse-server")
+mcp = FastMCP("ReliableEngineer-Tools")
+rag = RAGService()
+search_tool = DuckDuckGoSearchRun()
 
-server = Server("agent-power-tools")
-SHARED_STORAGE = "./shared_downloads"
-os.makedirs(SHARED_STORAGE, exist_ok=True)
+SHARED_DOWNLOADS = "./shared_downloads"
+os.makedirs(SHARED_DOWNLOADS, exist_ok=True)
 
-AVAILABLE_TOOLS = [
-    types.Tool(
-        name="web_search",
-        description="Search the internet.",
-        inputSchema={
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        },
-    ),
-    types.Tool(
-        name="create_file_for_download",
-        description="Creates a file on the server.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["filename", "content"],
-        },
-    ),
-]
 
-@server.list_tools()
-async def handle_list_tools():
-    return AVAILABLE_TOOLS
+@mcp.tool()
+def search_knowledge_base(query: str) -> str:
+    """Search local files (PDF, DOCX, TXT) for specific technical information."""
+    return rag.query(query)
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict | None):
-    if name == "web_search":
-        query = arguments.get("query")
-        search = DuckDuckGoSearchRun()
-        result = await asyncio.to_thread(search.run, query)
-        print("web_serach: ", result)
-        return [types.TextContent(type="text", text=result)]
-    elif name == "create_file_for_download":
-        filename = arguments.get("filename")
-        content = arguments.get("content")
-        file_path = os.path.join(SHARED_STORAGE, filename)
-        print("file: ", file_path)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return [types.TextContent(type="text", text=f"FILE_CREATED_SUCCESSFULLY: {filename}")]
-    raise ValueError(f"Unknown tool: {name}")
+@mcp.tool()
+def web_search(query: str) -> str:
+    """Search the web for real-time information if local knowledge is insufficient."""
+    return search_tool.run(query)
 
-sse = SseServerTransport("/messages")
-
-async def app(scope, receive, send):
-    """
-    Direct ASGI Application. 
-    Bypasses Starlette routing to avoid 'NoneType' errors.
-    """
-    if scope["type"] == "http":
-        path = scope["path"]
-        if path == "/sse":
-            async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
-                await server.run(
-                    read_stream,
-                    write_stream,
-                    server.create_initialization_options()
-                )
-        elif path == "/messages":
-            await sse.handle_post_message(scope, receive, send)
+@mcp.tool()
+def create_file_for_download(filename: str, content: str) -> str:
+    """Create a document on the server. Returns a download link."""
+    file_path = os.path.join(SHARED_DOWNLOADS, filename)
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        if ext == ".docx":
+            doc = Document()
+            doc.add_paragraph(content)
+            doc.save(file_path)
         else:
-            # Standard 404 for anything else
-            await send({
-                'type': 'http.response.start',
-                'status': 404,
-                'headers': [[b'content-type', b'text/plain']],
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b'Not Found',
-            })
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        return f"SUCCESS: File created. Link: http://localhost:30001/api/download/{filename}"
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+
+@mcp.resource("knowledge://status")
+def get_kb_status() -> str:
+    """Returns the current state of the knowledge base."""
+    count = rag.collection.count()
+    return f"Knowledge Base contains {count} vectors."
+
+@mcp.tool()
+def refresh_knowledge_base() -> str:
+    """Triggers a rescan of the local knowledge folder to find new files."""
+    return rag.sync()
 
 if __name__ == "__main__":
-    logger.info("🚀 Standalone MCP SSE Server live at http://localhost:30002")
-    uvicorn.run(app, host="0.0.0.0", port=30002)
+    mcp.run(transport="stdio")
